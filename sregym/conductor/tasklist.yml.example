@@ -138,6 +138,9 @@ all:
     rolling_update_misconfigured_social_network:
     - diagnosis
     - mitigation
+    incomplete_rollout_version_skew_hotel_reservation:
+    - diagnosis
+    - mitigation
     scale_pod_zero_social_net:
     - diagnosis
     - mitigation
