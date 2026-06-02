@@ -32,20 +32,14 @@ class IncompleteRolloutVersionSkew(Problem):
     """Run a previous build as a stray workload behind the live frontend Service."""
 
     FAULTY_SERVICE = "frontend"
-    # Previous build of the Hotel Reservation monolith. It is a real, pullable image
-    # that diverges from the current build (the same tag the correlated-image problems
-    # treat as the broken version), so the stray pods serve a genuinely different version.
-    STALE_IMAGE = "jackcuii/hotel-reservation:latest"
-    # Fallback only; the live current image is captured at injection time.
-    CURRENT_IMAGE_FALLBACK = "yinfangchen/hotel-reservation:latest"
-    # Generic, production-plausible name. It does not reveal the benchmark or the fault
-    # category; identifying that this workload pollutes the live Service is the task.
+
+    STALE_IMAGE = "deathstarbench/hotel-reservation:0.3.4"
+    CURRENT_IMAGE_FALLBACK = "yinfangchen/hotelreservation:latest"
     STALE_WORKLOAD_NAME = "frontend-canary"
-    # Distinguishing label so the stray workload's ReplicaSet owns only its own pods and
-    # never contends with the production Deployment's ReplicaSet for pod adoption.
     TRACK_LABEL_KEY = "track"
     TRACK_LABEL_VALUE = "canary"
     POD_TEMPLATE_HASH_LABEL = "pod-template-hash"
+
 
     def __init__(self):
         self.app = HotelReservation()
@@ -58,8 +52,6 @@ class IncompleteRolloutVersionSkew(Problem):
 
         self.stale_image = self.STALE_IMAGE
         self.stale_workload = self.STALE_WORKLOAD_NAME
-        # Overwritten with the live image during inject_fault; kept for the oracle and
-        # for human-readable messages before injection has run.
         self.current_image = self.CURRENT_IMAGE_FALLBACK
 
         self.root_cause = self.build_structured_root_cause(
@@ -124,16 +116,12 @@ class IncompleteRolloutVersionSkew(Problem):
 
         template_labels = dict(template.get("metadata", {}).get("labels", {}))
         selector_labels = dict(deployment["spec"]["selector"]["matchLabels"])
-        # pod-template-hash is owned by the Deployment controller for its own ReplicaSets;
-        # copying it would let two controllers fight over the same pods.
         template_labels.pop(self.POD_TEMPLATE_HASH_LABEL, None)
         selector_labels.pop(self.POD_TEMPLATE_HASH_LABEL, None)
 
         stale_template_labels = {**template_labels, self.TRACK_LABEL_KEY: self.TRACK_LABEL_VALUE}
         stale_selector_labels = {**selector_labels, self.TRACK_LABEL_KEY: self.TRACK_LABEL_VALUE}
 
-        # Copy the live pod spec verbatim and change only the image, so the single difference
-        # between the production pods and the stray pods is the container build.
         pod_spec = copy.deepcopy(template["spec"])
         for container in pod_spec.get("containers", []):
             container["image"] = self.stale_image
@@ -173,29 +161,34 @@ class IncompleteRolloutVersionSkew(Problem):
             )
 
     def _wait_for_version_skew(self, service_selector: dict, timeout: int = 180):
-        """Block until Service/<faulty_service> selects at least one pod on the stale image."""
         selector_str = self._selector_to_str(service_selector)
         deadline = time.monotonic() + timeout
-        last_seen = "no pods on the stale image yet"
+        last_seen = "no previous-build pod is serving yet"
 
         while time.monotonic() < deadline:
+            serving_ips = self._service_endpoint_ips(self.faulty_service)
             pods = self._get_json(
                 f"kubectl get pods -n {self.namespace} -l '{selector_str}' -o json",
                 f"pods for Service/{self.faulty_service}",
             )
             stale_pods = [pod for pod in pods.get("items", []) if self._pod_uses_image(pod, self.stale_image)]
-            if stale_pods:
-                names = ", ".join(pod.get("metadata", {}).get("name", "<unknown>") for pod in stale_pods)
-                print(f"Service/{self.faulty_service} now load-balances onto stale pods: {names}")
+            stale_serving = [pod for pod in stale_pods if pod.get("status", {}).get("podIP") in serving_ips]
+            if stale_serving:
+                names = ", ".join(pod.get("metadata", {}).get("name", "<unknown>") for pod in stale_serving)
+                print(f"Service/{self.faulty_service} now load-balances onto the previous build: {names}")
                 return
-            last_seen = f"{len(pods.get('items', []))} pod(s) selected, none on {self.stale_image}"
+            last_seen = (
+                f"{len(stale_pods)} previous-build pod(s) present, none Ready in the Service endpoints"
+                if stale_pods
+                else f"{len(pods.get('items', []))} pod(s) selected, none on {self.stale_image}"
+            )
             time.sleep(5)
 
         raise RuntimeError(
-            f"Service/{self.faulty_service} did not pick up a stale-image backend within {timeout}s. "
+            f"Service/{self.faulty_service} did not route to a previous-build backend within {timeout}s. "
             f"Last observation: {last_seen}"
         )
-    
+
 
     def _wait_for_skew_cleared(self, service_selector: dict, timeout: int = 180):
         selector_str = self._selector_to_str(service_selector)
@@ -217,10 +210,25 @@ class IncompleteRolloutVersionSkew(Problem):
         )
 
 
+    def _service_endpoint_ips(self, service: str) -> set:
+        """Return the set of Ready endpoint IPs currently backing the Service."""
+        endpoints = self._get_json(
+            f"kubectl get endpoints {service} -n {self.namespace} -o json", f"Endpoints/{service}"
+        )
+        ready_ips = set()
+        for subset in endpoints.get("subsets", []) or []:
+            for address in subset.get("addresses", []) or []:
+                ip = address.get("ip")
+                if ip:
+                    ready_ips.add(ip)
+        return ready_ips
+
+
     def _get_deployment_json(self, service: str) -> dict:
         return self._get_json(
             f"kubectl get deployment {service} -n {self.namespace} -o json", f"Deployment/{service}"
         )
+
 
     def _service_selector(self, service: str) -> dict:
         svc = self._get_json(f"kubectl get service {service} -n {self.namespace} -o json", f"Service/{service}")
@@ -243,6 +251,7 @@ class IncompleteRolloutVersionSkew(Problem):
     @staticmethod
     def _selector_to_str(selector: dict) -> str:
         return ",".join(f"{key}={value}" for key, value in sorted(selector.items()))
+
 
     def _get_json(self, command: str, resource_name: str) -> dict:
         raw = self.kubectl.exec_command(command).strip()
