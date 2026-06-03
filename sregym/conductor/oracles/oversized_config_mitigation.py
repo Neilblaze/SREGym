@@ -24,7 +24,7 @@ from json import JSONDecodeError
 
 from sregym.conductor.oracles.base import Oracle
 
-_DEFAULT_TIMEOUT_SECONDS = 90
+_DEFAULT_TIMEOUT_SECONDS = 180
 _DEFAULT_POLL_INTERVAL_SECONDS = 5
 _DEFAULT_CONSECUTIVE_HEALTHY_POLLS = 2
 

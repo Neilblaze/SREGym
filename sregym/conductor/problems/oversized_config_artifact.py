@@ -38,6 +38,7 @@ class OversizedConfigArtifact(Problem):
     CONFIG_KEY = "features.list"
     CONFIG_MOUNT = "/etc/classifier"
     CONSUMER_IMAGE = "busybox:1.36"
+    READY_MARKER = "/tmp/classifier-ready"
 
     # Capacity the consumer is "compiled" for. The oversized artifact exceeds it; the
     # known-good artifact stays within it.
@@ -132,6 +133,8 @@ class OversizedConfigArtifact(Problem):
         return (
             f"CAP={self.COMPILED_CAPACITY}\n"
             f'f={self.CONFIG_MOUNT}/{self.CONFIG_KEY}\n'
+            f"ready={self.READY_MARKER}\n"
+            'rm -f "$ready"\n'
             'n=$(grep -c . "$f" 2>/dev/null)\n'
             ": ${n:=0}\n"
             'echo "loaded $n features against compiled capacity $CAP"\n'
@@ -139,6 +142,7 @@ class OversizedConfigArtifact(Problem):
             '  echo "feature set $n exceeds compiled capacity $CAP, aborting load"\n'
             "  exit 1\n"
             "fi\n"
+            'touch "$ready"\n'
             "exec tail -f /dev/null\n"
         )
 
@@ -165,6 +169,11 @@ class OversizedConfigArtifact(Problem):
                                 "command": ["/bin/sh", "-c"],
                                 "args": [self._consumer_script()],
                                 "volumeMounts": [{"name": "config", "mountPath": self.CONFIG_MOUNT}],
+                                "readinessProbe": {
+                                    "exec": {"command": ["test", "-f", self.READY_MARKER]},
+                                    "initialDelaySeconds": 2,
+                                    "periodSeconds": 5,
+                                },
                             }
                         ],
                         "volumes": [{"name": "config", "configMap": {"name": self.CONFIG_NAME}}],
