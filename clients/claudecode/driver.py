@@ -14,6 +14,7 @@ from pathlib import Path
 import requests
 
 from clients.claudecode.claudecode_agent import ClaudeCodeAgent
+from clients.harness.problem_id import resolve_problem_id
 from logger import init_logger
 
 # Add SREGym root to path
@@ -40,8 +41,13 @@ def run_preflight() -> None:
     if env.get("CLAUDE_CODE_OAUTH_TOKEN"):
         env.pop("ANTHROPIC_API_KEY", None)
 
+    command = ["claude", "-p", "say ok", "--model", m]
+    reasoning_effort = os.environ.get("AGENT_REASONING_EFFORT")
+    if reasoning_effort:
+        command.extend(["--effort", reasoning_effort])
+
     r = subprocess.run(
-        ["claude", "-p", "say ok", "--model", m, "--max-turns", "1"],
+        command,
         capture_output=True,
         text=True,
         timeout=60,
@@ -72,23 +78,6 @@ def get_app_info() -> dict:
         return app_info
     except Exception as e:
         logger.error(f"Failed to get app info: {e}")
-        raise
-
-
-def get_problem_id() -> str:
-    """Get current problem ID from conductor API."""
-    api_url = f"{get_api_base_url()}/get_problem"
-    logger.info(f"Fetching problem ID from {api_url}")
-
-    try:
-        response = requests.get(api_url)
-        response.raise_for_status()
-        problem_data = response.json()
-        problem_id = problem_data.get("problem_id")
-        logger.info(f"Problem ID: {problem_id}")
-        return problem_id
-    except Exception as e:
-        logger.error(f"Failed to get problem ID: {e}")
         raise
 
 
@@ -251,6 +240,12 @@ def main():
         help="Directory to store logs (default: ./logs/claudecode)",
     )
     parser.add_argument(
+        "--problem-id",
+        type=str,
+        default=None,
+        help="Problem ID for artifact naming (default: SREGYM_ARTIFACT_ID in benchmark runs)",
+    )
+    parser.add_argument(
         "--sessions-dir",
         type=str,
         default=None,
@@ -285,13 +280,15 @@ def main():
         logger.error(f"Timeout waiting for conductor: {e}")
         sys.exit(1)
 
-    # Get problem information
+    # Get app info for the agent prompt; problem_id is for harness artifacts only
     try:
         app_info = get_app_info()
-        problem_id = get_problem_id()
     except Exception as e:
-        logger.error(f"Failed to get problem information: {e}")
+        logger.error(f"Failed to get app info: {e}")
         sys.exit(1)
+
+    problem_id = resolve_problem_id(cli_problem_id=args.problem_id)
+    logger.info(f"Problem ID (harness): {problem_id}")
 
     # Build instruction
     instruction = build_instruction(app_info)

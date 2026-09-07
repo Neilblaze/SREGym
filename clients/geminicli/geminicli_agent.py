@@ -9,6 +9,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -111,16 +112,19 @@ class GeminiCliAgent:
         return self.logs_dir / "sessions"
 
     def _find_session_file(self) -> Path | None:
-        """Find the most recent Gemini session file."""
+        """Find the most recent Gemini session file.
+
+        Gemini CLI writes sessions under ``~/.gemini/tmp/<hash>/chats/`` as
+        ``session-*.json`` (older) or ``session-*.jsonl`` (v0.40+). Search both
+        extensions and fall back to a recursive scan, matching Harbor's copy
+        step — the narrow ``*/chats/*.json`` glob alone misses newer JSONL
+        sessions and any layout change.
+        """
         tmp_dir = self.gemini_home / "tmp"
         if not tmp_dir.exists():
             return None
 
-        # Gemini stores sessions in: ~/.gemini/tmp/*/chats/session-*.json
-        session_files = list(tmp_dir.glob("*/chats/session-*.json"))
-        if not session_files:
-            # Fallback to old location
-            session_files = list(tmp_dir.glob("session-*.json"))
+        session_files = [p for pat in ("session-*.json", "session-*.jsonl") for p in tmp_dir.rglob(pat)]
         if not session_files:
             return None
 
@@ -142,7 +146,9 @@ class GeminiCliAgent:
 
             # Extract session ID from filename (session-2026-02-04T16-12-e580aecd.json -> e580aecd)
             session_id = session_file.stem.split("-")[-1] if "-" in session_file.stem else session_file.stem
-            archived_path = session_subdir / f"session-{session_id}.json"
+            # Preserve the real extension (.json or .jsonl); the ATIF adapter
+            # handles both shapes.
+            archived_path = session_subdir / f"session-{session_id}{session_file.suffix}"
             shutil.copy(session_file, archived_path)
             logger.info(f"Archived session to {archived_path}")
 
@@ -195,6 +201,30 @@ class GeminiCliAgent:
         logger.info(f"Extracted usage metrics: {metrics}")
         return metrics
 
+    def _build_command(self, instruction: str) -> str:
+        model = self.model_name.split("/")[-1]
+        escaped_instruction = shlex.quote(instruction)
+        return f"gemini -p {escaped_instruction} -y -m {model}"
+
+    def _prepare_filtered_settings(self) -> Path | None:
+        """Create a per-run Gemini settings file for provider-side tool blocking."""
+        if os.environ.get("AGENT_INTERNET_ACCESS") != "filtered":
+            return None
+
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            prefix="gemini-system-settings-",
+            suffix=".json",
+            dir=self.logs_dir,
+            delete=False,
+        ) as settings_file:
+            json.dump(
+                {"tools": {"exclude": ["google_web_search", "web_fetch", "browser_agent"]}},
+                settings_file,
+            )
+            return Path(settings_file.name)
+
     def run(self, instruction: str) -> int:
         """
         Run the Gemini CLI agent with the given instruction.
@@ -213,6 +243,11 @@ class GeminiCliAgent:
 
         # Build environment variables
         env = os.environ.copy()
+
+        # Headless/automated runs: the working dir isn't interactively "trusted",
+        # which otherwise downgrades approval mode and blocks tool calls. This is
+        # the documented env var for headless environments.
+        env["GEMINI_CLI_TRUST_WORKSPACE"] = "true"
 
         # Auth environment variables
         auth_vars = [
@@ -240,9 +275,10 @@ class GeminiCliAgent:
             logger.error("=" * 80)
             return 1
 
-        # Build command
-        escaped_instruction = shlex.quote(instruction)
-        command = f"gemini -p {escaped_instruction} -y -m {model}"
+        command = self._build_command(instruction)
+        filtered_settings = self._prepare_filtered_settings()
+        if filtered_settings is not None:
+            env["GEMINI_CLI_SYSTEM_SETTINGS_PATH"] = str(filtered_settings)
 
         logger.info(f"Executing command: {command}")
 
@@ -277,3 +313,6 @@ class GeminiCliAgent:
         except Exception as e:
             logger.error(f"Error running Gemini CLI: {e}")
             raise
+        finally:
+            if filtered_settings is not None:
+                filtered_settings.unlink(missing_ok=True)

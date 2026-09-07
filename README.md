@@ -27,6 +27,11 @@ SREGym has been used to simulate real-world cloud failures, such as:
 - Exhausting conntrack table space crippled a production cluster ([postmortem](https://www.markbetz.net/2023/12/12/exhausting-conntrack-table-space-crippled-our-k8s-cluster), [simulation](https://github.com/SREGym/SREGym/pull/768))
 - GKE ran out of IP addresses ([postmortem](https://deploy.live/blog/when-gke-ran-out-of-ip-addresses), [simulation](https://github.com/SREGym/SREGym/pull/774))
 - Kafka poison pill ([postmortem](https://www.lydtechconsulting.com/blog/kafka-poison-pill), [simulation](https://github.com/SREGym/SREGym/pull/790))
+- The Reddit Pi-Day Outage ([postmortem](https://www.reddit.com/r/RedditEng/comments/11xx5o0/you_broke_reddit_the_piday_outage/), [simulation](https://github.com/SREGym/SREGym/pull/828))
+
+<h2 id="🚀SREGym-Lite">🚀🚀🚀 Start with SREGym-Lite</h2>
+
+[SREGym-Lite](./docs/SREGym-Lite.md) is a curated set of 21 representative problems with varied difficulty levels that are friendly to run. It is the recommended starting point for new users and can run easily on a [Kind](https://kind.sigs.k8s.io/) setup with 8 vCPU and 16 GB of memory.
 
 
 <h2 id="📦installation">📦 Installation</h2>
@@ -35,7 +40,6 @@ SREGym has been used to simulate real-world cloud failures, such as:
 - Python >= 3.12
 - [Docker](https://docs.docker.com/get-docker/)
 - [Helm](https://helm.sh/docs/intro/install/) >= 4.0
-- [brew](https://brew.sh/)
 - [kubectl](https://kubernetes.io/docs/tasks/tools/)
 - [uv](https://github.com/astral-sh/uv)
 - [kind](https://kind.sigs.k8s.io/) (if running locally)
@@ -57,9 +61,10 @@ uv run prek install
 Choose either a) or b) to set up your cluster and then proceed to the next steps.
 
 ### a) Kubernetes Cluster (Recommended)
-SREGym supports any kubernetes cluster that your `kubectl` context is set to, whether it's a cluster from a cloud provider or one you build yourself.
+SREGym runs on a self-managed Kubernetes cluster that you provision on Linux hosts you have SSH and root access to (e.g. [CloudLab](https://www.cloudlab.us/), bare-metal machines, or cloud VMs/VPS instances). We provide an Ansible playbook that builds the cluster for you. Follow this [README](./scripts/ansible/README.md) to set it up.
 
-We have an Ansible playbook to setup clusters on providers like [CloudLab](https://www.cloudlab.us/) and our own machines. Follow this [README](./scripts/ansible/README.md) to set up your own cluster.
+> [!NOTE]
+> A managed Kubernetes service won't work out of the box, since SREGym's setup needs SSH and root access to the nodes for OS-level cluster configuration. Instead, spin up a few plain VMs/VPS instances and add them to `inventory.yml`.
 
 ### b) Emulated cluster
 SREGym can be run on an emulated cluster using [kind](https://kind.sigs.k8s.io/) on your local machine. However, not all problems are supported.
@@ -98,14 +103,19 @@ export AWS_PROFILE="bedrock"
 export AWS_DEFAULT_REGION="us-east-2"
 ```
 
-2. Run the benchmark:
+2. Run the full benchmark:
 ```bash
-python main.py --agent stratus --model gpt-5
+uv run main.py --agent stratus --model gpt-5
+```
+
+Or start with SREGym-Lite:
+```bash
+uv run main.py --suite sregym-lite --agent stratus --model gpt-5
 ```
 
 Use `--judge-model` to override the judge model separately (defaults to `--model`):
 ```bash
-python main.py --agent stratus --model gpt-5 --judge-model anthropic/claude-sonnet-4-6-20250627
+uv run main.py --agent stratus --model gpt-5 --judge-model anthropic/claude-sonnet-4-6-20250627
 ```
 
 #### Container Isolation
@@ -115,8 +125,49 @@ Agents always run in isolated Docker containers, preventing access to SREGym int
 Use `--force-build` to rebuild the container image after updating dependencies or agent code:
 
 ```bash
-python main.py --agent codex --model gpt-5 --force-build
+uv run main.py --agent codex --model gpt-5 --force-build
 ```
+
+Containerized agents can use the public internet by default, but direct access to the benchmark's GitHub source is
+blocked. Use `--internet-access open` only when you intentionally need the previous unrestricted network behavior.
+
+### Deployment Profiles
+
+`--profile` controls how much infrastructure SREGym stands up. It is independent of
+`--suite` — the profile selects *what gets deployed*, the suite selects *which problems run*.
+
+| Profile | Behaviour |
+|---------|-----------|
+| `full` (default) | The standard stack. Use this for results you intend to compare against the leaderboard. |
+| `svelte` | Additionally drops components that nothing in SREGym reads, and shortens metric retention. |
+
+```bash
+uv run main.py --suite sregym-lite --agent stratus --model gpt-5 --profile svelte
+```
+
+`svelte` removes:
+
+- astronomy-shop's bundled **OpenSearch**, **Grafana** and **Jaeger**. Nothing in `sregym/`,
+  `mcp_server/` or `clients/` queries OpenSearch or Grafana; the bundled Jaeger is deleted
+  moments after deployment anyway, by `Jaeger.create_external_name_service()`.
+- Prometheus **Alertmanager** and **Pushgateway** (no alert rules are configured and nothing
+  pushes), and TSDB retention cut from 15d to 2h.
+- The OpenEBS **node-disk-manager** stack, which backs the `openebs-device` StorageClass.
+  SREGym only provisions through `openebs-hostpath`.
+
+Measured on one astronomy-shop problem (peak RSS / peak CPU, sampled over the run):
+
+| | `full` | `svelte` |
+|---|---|---|
+| OpenSearch | 1096 MiB / 1709m | — |
+| Grafana | 475 MiB / 303m | — |
+| OpenEBS NDM (7 pods) | ~190 MiB / 582m | — |
+
+> [!WARNING]
+> `svelte` changes what an agent can observe in the cluster, so its scores are **not**
+> comparable with `full`. It is intended for local iteration on memory-constrained hosts,
+> not for leaderboard submissions. Note that `--profile svelte` and `--suite sregym-lite`
+> are unrelated: you can run either without the other.
 
 ### Model Selection
 
@@ -137,27 +188,75 @@ Set the required environment variable for your provider before running:
 | AWS Bedrock | `bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0` | `AWS_PROFILE`, `AWS_DEFAULT_REGION` |
 | Azure | `azure/gpt-4o` | `AZURE_API_KEY`, `AZURE_API_BASE`, `AZURE_API_VERSION` |
 
+#### Local LLMs
+
+SREGym supports local models through Ollama and OpenAI-compatible servers such as vLLM and LM Studio. The examples below use Ollama.
+
+Set `AGENT_API_KEY` as well if the endpoint requires authentication.
+
+> [!CAUTION]
+> When you use `--internet-access filtered`, the agent runs on an isolated Docker network. It cannot reach a local model server that listens only on `127.0.0.1` or `localhost`. Configure the server to listen on a host-reachable interface, such as `0.0.0.0`, and use `http://host.docker.internal:<port>` as the API base. Protect the exposed port with authentication or a firewall. This requirement is the same for Kind and external Kubernetes clusters because the connection is between the agent container and the machine running SREGym.
+
+**Stratus with Ollama:**
+
+```bash
+ollama pull qwen3-coder:30b
+
+export AGENT_API_BASE="http://127.0.0.1:11434"
+uv run main.py --agent stratus --model ollama_chat/qwen3-coder:30b
+```
+
+**OpenCode with Ollama:**
+
+OpenCode uses the endpoint's OpenAI-compatible `/v1` API.
+
+```bash
+export AGENT_API_BASE="http://127.0.0.1:11434/v1"
+uv run main.py --agent opencode --model local/qwen3-coder:30b
+```
+
+When `--judge-model` is not set, SREGym reuses the agent model and endpoint for the judge. This works directly for Stratus because its model identifier is LiteLLM-compatible. For OpenCode, SREGym normalizes `local/<served-model>` to `openai/<served-model>` for the judge, because OpenCode's `local/` provider uses an OpenAI-compatible endpoint.
+
+For vLLM, LM Studio, or another OpenAI-compatible server, point `AGENT_API_BASE` to its `/v1` endpoint and use `openai/<served-model>` with Stratus or `local/<served-model>` with OpenCode.
+
+To use a different LiteLLM judge provider, pass `--judge-model` explicitly:
+
+```bash
+export JUDGE_API_BASE="http://127.0.0.1:11434"
+uv run main.py --agent opencode --model local/qwen3-coder:30b --judge-model ollama_chat/qwen3-coder:30b
+```
+
+**Separate judge endpoint:**
+
+Set `JUDGE_API_BASE` and `JUDGE_API_KEY` when the judge uses a different endpoint or credential:
+
+```bash
+export JUDGE_API_BASE="https://example.test/v1"
+export JUDGE_API_KEY="..."
+uv run main.py --agent stratus --model ollama_chat/qwen3-coder:30b --judge-model gpt-5
+```
+
 <details>
 <summary><strong>Provider Examples</strong></summary>
 
 **OpenAI:**
 ```bash
-python main.py --agent stratus --model gpt-5
+uv run main.py --agent stratus --model gpt-5
 ```
 
 **Anthropic:**
 ```bash
-python main.py --agent stratus --model anthropic/claude-sonnet-4-6
+uv run main.py --agent stratus --model anthropic/claude-sonnet-4-6
 ```
 
 **Google:**
 ```bash
-python main.py --agent stratus --model gemini/gemini-2.5-pro
+uv run main.py --agent stratus --model gemini/gemini-2.5-pro
 ```
 
 **AWS Bedrock:**
 ```bash
-python main.py --agent stratus --model bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0
+uv run main.py --agent stratus --model bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0
 ```
 
 **Note:** For AWS Bedrock, ensure your AWS credentials are configured via `~/.aws/credentials` and your profile has permissions to access Bedrock.

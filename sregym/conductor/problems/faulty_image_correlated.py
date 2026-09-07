@@ -2,16 +2,14 @@ from sregym.conductor.oracles.incorrect_image_mitigation import IncorrectImageMi
 from sregym.conductor.oracles.llm_as_a_judge.llm_as_a_judge_oracle import LLMAsAJudgeOracle
 from sregym.conductor.problems.base import Problem
 from sregym.generators.fault.inject_app import ApplicationFaultInjector
-from sregym.service.apps.hotel_reservation import HotelReservation
+from sregym.service.apps.hotel_reservation import HOTEL_RESERVATION_APPLICATION_IMAGE, HotelReservation
 from sregym.service.kubectl import KubeCtl
 from sregym.utils.decorators import mark_fault_injected
 
 
 class FaultyImageCorrelated(Problem):
     def __init__(self):
-        self.app = HotelReservation()
-        self.namespace = self.app.namespace
-        super().__init__(app=self.app, namespace=self.namespace)
+        super().__init__(app=HotelReservation())
         self.kubectl = KubeCtl()
         self.faulty_service = ["frontend", "geo", "profile", "rate", "recommendation", "reservation", "user", "search"]
         self.injector = ApplicationFaultInjector(namespace=self.namespace)
@@ -51,5 +49,5 @@ class FaultyImageCorrelated(Problem):
             self.injector.recover_incorrect_image(
                 deployment_name=service,
                 namespace=self.namespace,
-                correct_image="yinfangchen/hotel-reservation:latest",
+                correct_image=HOTEL_RESERVATION_APPLICATION_IMAGE,
             )

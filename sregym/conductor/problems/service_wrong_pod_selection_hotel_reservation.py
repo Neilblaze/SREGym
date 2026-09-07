@@ -8,10 +8,11 @@ from sregym.utils.decorators import mark_fault_injected
 
 
 class ServiceWrongPodSelectionHotelReservation(Problem):
+    FRONTEND_SERVICE_PORT = 5000
+
     def __init__(self):
-        self.app = HotelReservation()
-        self.namespace = self.app.namespace
         self.frontend_service = "frontend"
+        self.expected_service_port = self.FRONTEND_SERVICE_PORT
         self.wrong_deployment = "search"
         self.route_label_key = "service-route"
         self.route_label_value = "frontend"
@@ -19,7 +20,7 @@ class ServiceWrongPodSelectionHotelReservation(Problem):
         self.faulty_service_selector = {self.route_label_key: self.route_label_value}
         self.expected_endpoint_pod_label = "frontend"
 
-        super().__init__(app=self.app, namespace=self.namespace)
+        super().__init__(app=HotelReservation())
         self.kubectl = KubeCtl()
         self.root_cause = self.build_structured_root_cause(
             component=f"service/{self.frontend_service}",
