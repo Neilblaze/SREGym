@@ -11,10 +11,8 @@ from sregym.utils.decorators import mark_fault_injected
 
 class WorkloadImbalance(Problem):
     def __init__(self):
-        self.app = AstronomyShop()
         self.kubectl = KubeCtl()
-        self.namespace = self.app.namespace
-        super().__init__(app=self.app, namespace=self.namespace)
+        super().__init__(app=AstronomyShop())
         self.faulty_service = ["frontend"]
         self.injector = VirtualizationFaultInjector(namespace="kube-system")
         self.injector_for_scale = VirtualizationFaultInjector(namespace=self.namespace)
@@ -53,9 +51,8 @@ class WorkloadImbalance(Problem):
     @mark_fault_injected
     def recover_fault(self):
         print("== Fault Recovery ==")
-        self.injector.inject_daemon_set_image_replacement(
-            daemon_set_name="kube-proxy", new_image="registry.k8s.io/kube-proxy:v1.31.13"
-        )
+        if not self.injector.recover_daemon_set_image_replacement(daemon_set_name="kube-proxy"):
+            raise RuntimeError("The saved kube-proxy image is missing")
         print(f"Service: {self.faulty_service[0]} | Namespace: {self.namespace}\n")
         self.injector_for_scale.scale_pods_to(replicas=1, microservices=self.faulty_service)
         self.kubectl.wait_for_ready(namespace=self.namespace)

@@ -103,6 +103,13 @@ class ClaudeCodeAgent:
         "WebSearch",
     ]
 
+    @classmethod
+    def allowed_tools(cls) -> list[str]:
+        tools = list(cls.ALLOWED_TOOLS)
+        if os.environ.get("AGENT_INTERNET_ACCESS") == "filtered":
+            tools.remove("WebSearch")
+        return tools
+
     def __init__(
         self,
         logs_dir: Path,
@@ -337,6 +344,7 @@ class ClaudeCodeAgent:
 
         # Set model name
         env["ANTHROPIC_MODEL"] = model
+        reasoning_effort = os.environ.get("AGENT_REASONING_EFFORT")
 
         # Pass through MAX_THINKING_TOKENS if set
         if "MAX_THINKING_TOKENS" in os.environ:
@@ -350,8 +358,10 @@ class ClaudeCodeAgent:
             "stream-json",
             "-p",
             instruction,
-            "--allowedTools",
-        ] + self.ALLOWED_TOOLS
+        ]
+        if reasoning_effort:
+            command.extend(["--effort", reasoning_effort])
+        command.extend(["--allowedTools", *self.allowed_tools()])
 
         logger.info(f"Executing command: {' '.join(command)}")
 

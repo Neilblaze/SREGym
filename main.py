@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import contextlib
 import csv
 import importlib
 import logging
@@ -7,6 +8,7 @@ import os
 import sys
 import threading
 import time
+from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 
@@ -20,18 +22,37 @@ from rich.progress import (
     TimeRemainingColumn,
 )
 
+from clients.harness.problem_id import HARNESS_ARTIFACT_ID_ENV, HARNESS_PROBLEM_ID_ENV
 from logger import console, init_logger
 from sregym.agent_launcher import AgentLauncher
 from sregym.agent_registry import get_agent, list_agents
 from sregym.conductor.conductor import Conductor, ConductorConfig
 from sregym.conductor.conductor_api import request_shutdown, run_api
 from sregym.conductor.constants import StartProblemResult
-from sregym.service.container_runner import ContainerRunner, ExecInput
+from sregym.conductor.problem_sets import PROBLEM_SETS
+from sregym.profile import PROFILES, set_profile
+from sregym.results.resume import complete_resume_rows
+from sregym.run_artifacts import ArtifactFinalizationError, RunArtifacts
+from sregym.service.container_runner import ContainerRunner, ExecInput, get_container_host_bind_address
+from sregym.service.internet_policy import InternetPolicy
+from sregym.traces import postprocess as trace_postprocess
+from sregym.traces import store as trace_store
 
 LAUNCHER = AgentLauncher()
 logger = logging.getLogger(__name__)
 _driver_results: list[dict] = []
 _driver_base_dir: Path | None = None
+_driver_error: BaseException | None = None
+EVALUATION_DRAIN_TIMEOUT_SECONDS = 300
+CLEANUP_DRAIN_TIMEOUT_SECONDS = 300
+
+
+class BenchmarkCampaignAborted(RuntimeError):
+    """The campaign stopped safely after persisting its partial results."""
+
+    def __init__(self, message: str, partial_results: list[dict]):
+        super().__init__(message)
+        self.partial_results = partial_results
 
 
 def run_preflight_check(
@@ -46,6 +67,9 @@ def run_preflight_check(
         "stratus": "clients.stratus.stratus_agent.driver.driver",
         "claudecode": "clients.claudecode.driver",
         "codex": "clients.codex.driver",
+        "copilot": "clients.copilot.driver",
+        "opencode": "clients.opencode.driver",
+        "gemini": "clients.geminicli.driver",
     }
 
     module_path = agent_driver_modules.get(agent_name)
@@ -65,16 +89,42 @@ def run_preflight_check(
         check_cmd = f"/opt/sregym/install-scripts/{install_script} > /dev/null 2>&1 && {check_cmd}"
 
     logger.info(f"🔍 Running pre-flight check for '{agent_name}'...")
-    result = container_runner.run_sync(ExecInput(command=check_cmd, label="preflight", timeout=180))
+    try:
+        result = container_runner.run_sync(ExecInput(command=check_cmd, label="preflight", timeout=180))
+    except BaseException:
+        # A failed or interrupted preflight happens before the API shutdown
+        # scope exists, so release the proxy and its Docker resources here.
+        container_runner.cleanup_egress_proxy()
+        container_runner.cleanup_credential_tmps()
+        raise
     if result.returncode != 0:
         if result.stdout:
             print(result.stdout.strip())
         if result.stderr:
             print(result.stderr.strip())
         logger.error(f"❌ Pre-flight check failed for '{agent_name}'")
+        container_runner.cleanup_egress_proxy()
+        container_runner.cleanup_credential_tmps()
         sys.exit(1)
 
     logger.info(f"✅ Pre-flight check passed for '{agent_name}'")
+
+
+def run_judge_preflight_check() -> None:
+    """Validate the judge model and credentials through its LiteLLM backend."""
+    from llm_backend.init_backend import get_llm_backend_for_judge
+
+    logger.info("🔍 Running pre-flight check for judge model...")
+    try:
+        get_llm_backend_for_judge().inference("Say ok.", system_prompt="Reply with exactly 'ok'.")
+    except Exception as e:
+        logger.error(f"❌ Judge pre-flight check failed: {e}")
+        logger.error(
+            "The judge uses LiteLLM. Ensure the model is LiteLLM-compatible or pass a compatible --judge-model."
+        )
+        sys.exit(1)
+
+    logger.info("✅ Judge pre-flight check passed")
 
 
 def get_current_datetime_formatted():
@@ -83,9 +133,78 @@ def get_current_datetime_formatted():
     return formatted_datetime
 
 
+def _restore_env_var(name: str, previous_value: str | None) -> None:
+    if previous_value is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = previous_value
+
+
+def _env_status(name: str) -> str:
+    return "set" if os.environ.get(name) else "unset"
+
+
+def _is_opencode_local_model(agent: str | None, model: str) -> bool:
+    return agent == "opencode" and model.startswith("local/")
+
+
+def _normalize_opencode_local_model_for_litellm(model: str) -> str:
+    return f"openai/{model.split('/', 1)[1]}"
+
+
+def _configure_model_environment(args) -> tuple[str, str]:
+    agent_model = args.model
+    raw_judge_model = args.judge_model or args.model
+    reasoning_effort = getattr(args, "reasoning_effort", None)
+    normalizes_opencode_local_judge = _is_opencode_local_model(args.agent, raw_judge_model)
+    judge_model = (
+        _normalize_opencode_local_model_for_litellm(raw_judge_model)
+        if normalizes_opencode_local_judge
+        else raw_judge_model
+    )
+
+    os.environ["AGENT_MODEL_ID"] = agent_model
+    os.environ["JUDGE_MODEL_ID"] = judge_model
+    if reasoning_effort:
+        os.environ["AGENT_REASONING_EFFORT"] = reasoning_effort
+    else:
+        os.environ.pop("AGENT_REASONING_EFFORT", None)
+
+    if not getattr(args, "judge_model", None) or normalizes_opencode_local_judge:
+        if not os.environ.get("JUDGE_API_BASE") and os.environ.get("AGENT_API_BASE"):
+            os.environ["JUDGE_API_BASE"] = os.environ["AGENT_API_BASE"]
+        if not os.environ.get("JUDGE_API_KEY") and os.environ.get("AGENT_API_KEY"):
+            os.environ["JUDGE_API_KEY"] = os.environ["AGENT_API_KEY"]
+
+    if normalizes_opencode_local_judge:
+        if not os.environ.get("JUDGE_API_BASE"):
+            raise ValueError("AGENT_API_BASE or JUDGE_API_BASE is required to use an OpenCode local model as the judge")
+        if not os.environ.get("JUDGE_API_KEY"):
+            os.environ["JUDGE_API_KEY"] = "dummy"
+
+    return agent_model, judge_model
+
+
+@contextlib.contextmanager
+def _artifact_environment(run: RunArtifacts):
+    previous = {
+        "AGENT_LOGS_DIR": os.environ.get("AGENT_LOGS_DIR"),
+        HARNESS_ARTIFACT_ID_ENV: os.environ.get(HARNESS_ARTIFACT_ID_ENV),
+        HARNESS_PROBLEM_ID_ENV: os.environ.get(HARNESS_PROBLEM_ID_ENV),
+    }
+    os.environ["AGENT_LOGS_DIR"] = str(run.active_dir.resolve())
+    os.environ[HARNESS_ARTIFACT_ID_ENV] = run.artifact_id
+    os.environ.pop(HARNESS_PROBLEM_ID_ENV, None)
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            _restore_env_var(name, value)
+
+
 def driver_loop(
     conductor: Conductor,
-    problem_filter: str | None = None,
+    problem_selection: Sequence[str] | None = None,
     agent_to_run: str | None = None,
     use_external_harness: bool = False,
     n_attempts: int = 1,
@@ -98,7 +217,7 @@ def driver_loop(
 
     Args:
         conductor: The Conductor instance
-        problem_filter: Optional problem ID to run. If specified, only this problem will be run.
+        problem_selection: Optional ordered problem IDs to run. If omitted, use the registry's default selection.
         agent_to_run: Agent name to run (required unless use_external_harness is True).
         use_external_harness: If True, inject fault and exit without running evaluation logic.
         n_attempts: Number of end-to-end attempts to run each problem.
@@ -130,15 +249,44 @@ def driver_loop(
 
         all_results_for_agent = []
 
-        # Get all problem IDs and filter if needed
+        async def finish_problem_with_deadline(timeout_reason: str) -> bool:
+            """Run safety cleanup without letting a stuck Kubernetes call hang the campaign."""
+            try:
+                conductor.finish_problem_in_background()
+                await conductor.wait_for_submission_work(timeout=CLEANUP_DRAIN_TIMEOUT_SECONDS)
+            except TimeoutError:
+                conductor.abandon_submission_work()
+                conductor.results["cleanup_timed_out"] = True
+                conductor.record_incomplete_attempt(timeout_reason)
+                console.log(
+                    "⛔ Conductor cleanup did not finish before the cleanup deadline; "
+                    "aborting without starting another attempt"
+                )
+                return False
+            except Exception as exc:
+                conductor.results["cleanup_failed"] = True
+                conductor.results["cleanup_error"] = f"{type(exc).__name__}: {exc}"
+                conductor.record_incomplete_attempt("cleanup_failed")
+                console.log(f"⛔ Conductor cleanup raised: {exc}")
+                return False
+            return not conductor.results.get("cleanup_failed", False)
+
+        # Get all problem IDs and apply an explicit CLI selection when supplied.
         problem_ids = conductor.problems.get_problem_ids()
         all_problem_ids = conductor.problems.get_problem_ids(all=True)
-        if problem_filter:
-            if problem_filter not in all_problem_ids:
-                console.log(f"⚠️  Problem '{problem_filter}' not found in registry. Available problems: {problem_ids}")
+        if problem_selection is not None:
+            unknown_problem_ids = set(problem_selection) - set(all_problem_ids)
+            if unknown_problem_ids:
+                console.log(
+                    f"⚠️  Problems not found in registry: {sorted(unknown_problem_ids)}. "
+                    f"Available problems: {all_problem_ids}"
+                )
                 sys.exit(1)
-            problem_ids = [problem_filter]
-            console.log(f"🎯 Running single problem: {problem_filter}")
+            problem_ids = list(problem_selection)
+            if len(problem_ids) == 1:
+                console.log(f"🎯 Running single problem: {problem_ids[0]}")
+            else:
+                console.log(f"🎯 Running selected benchmark suite: {len(problem_ids)} problems")
 
         # sanity check: are there any specified problem ids that do not exist in the registry?
         unknown_problem_ids = set(problem_ids) - set(all_problem_ids)
@@ -153,20 +301,25 @@ def driver_loop(
         from collections import Counter
 
         completed_problems: set[str] = set()
+        completed_attempts: dict[str, set[int]] = {}
         attempt_counts: Counter[str] = Counter()
         if resume_csv:
             try:
                 with open(resume_csv, newline="") as f:
                     reader = csv.DictReader(f)
                     resume_rows = list(reader)
-                # Group by problem_id and count attempts
-                attempt_counts = Counter(r["problem_id"] for r in resume_rows)
-                completed_problems = {pid for pid, count in attempt_counts.items() if count >= n_attempts}
 
-                for row in resume_rows:
+                complete_rows = complete_resume_rows(resume_rows, n_attempts)
+
+                for (pid, attempt_number), row in complete_rows.items():
+                    completed_attempts.setdefault(pid, set()).add(attempt_number)
                     all_results_for_agent.append(row)
+
+                attempt_counts = Counter({pid: len(attempts) for pid, attempts in completed_attempts.items()})
+                completed_problems = {pid for pid, count in attempt_counts.items() if count >= n_attempts}
                 console.log(
-                    f"📋 Resuming from {resume_csv}: {len(completed_problems)} problems already done, skipping them"
+                    f"📋 Resuming from {resume_csv}: {len(completed_problems)} problems already done; "
+                    "incomplete attempts will be rerun"
                 )
             except Exception as e:
                 console.log(f"⚠️  Failed to load resume CSV: {e}")
@@ -193,7 +346,6 @@ def driver_loop(
         for pid in problem_ids:
             if pid in completed_problems:
                 console.log(f"⏭️  Skipping already-completed problem: {pid}")
-                progress.advance(task_id, n_attempts)
                 continue
 
             conductor.problem_id = pid
@@ -201,7 +353,11 @@ def driver_loop(
             # Keep a record of results for this problem in a temp file in case an attempt fails
             tmp_path = f"_running_{pid}_{agent_to_run}_results.csv"
 
-            for attempt in range(1, n_attempts + 1):
+            attempts_to_run = [
+                attempt for attempt in range(1, n_attempts + 1) if attempt not in completed_attempts.get(pid, set())
+            ]
+            for attempt_position, attempt in enumerate(attempts_to_run):
+                abort_campaign_after_attempt = False
                 progress.update(
                     task_id,
                     description=f"[cyan]Benchmarking {agent_to_run or 'agent'} — {pid} (attempt {attempt}/{n_attempts})",
@@ -211,6 +367,7 @@ def driver_loop(
                 # Retry start_problem up to 3 times to handle transient deploy failures
                 max_deploy_retries = 3
                 result = None
+                deploy_cleanup_failed = False
                 for deploy_attempt in range(1, max_deploy_retries + 1):
                     try:
                         result = await conductor.start_problem()
@@ -222,10 +379,13 @@ def driver_loop(
                         )
                         if deploy_attempt < max_deploy_retries:
                             console.log("🧹 Cleaning up before retry...")
-                            try:
-                                conductor._finish_problem()
-                            except Exception as cleanup_err:
-                                console.log(f"⚠️  Cleanup error (non-fatal): {cleanup_err}")
+                            cleanup_succeeded = await finish_problem_with_deadline(
+                                "cleanup_timeout_after_deploy_failure"
+                            )
+                            if not cleanup_succeeded:
+                                deploy_cleanup_failed = True
+                                console.log("⛔ Cleanup failed; refusing to retry deployment against uncertain state")
+                                break
                             console.log(f"🔄 Retrying start_problem for '{pid}'...")
                         else:
                             console.log(
@@ -237,29 +397,59 @@ def driver_loop(
                     # The inner retry loop already logged the failure. Don't crash the
                     # entire driver — record the failure, clean up cluster state, and
                     # move on to the next problem so the benchmark can keep making progress.
-                    try:
-                        conductor._finish_problem()
-                    except Exception as cleanup_err:
-                        console.log(f"⚠️  Cleanup after exhausted deploy retries failed (non-fatal): {cleanup_err}")
+                    if not deploy_cleanup_failed:
+                        deploy_cleanup_failed = not await finish_problem_with_deadline(
+                            "cleanup_timeout_after_deploy_failure"
+                        )
+                    if deploy_cleanup_failed and conductor.results.get("run_status") != "incomplete":
+                        conductor.record_incomplete_attempt("cleanup_failed")
                     snapshot = {
                         "problem_id": pid,
                         "attempt": attempt,
                         "deploy_failed": True,
                     }
+                    for stage, outcome in conductor.results.items():
+                        if isinstance(outcome, dict):
+                            for key, value in outcome.items():
+                                snapshot[f"{stage}.{key}"] = value
+                        else:
+                            snapshot[stage] = outcome
                     all_results_for_agent.append(snapshot)
                     fieldnames = sorted({key for row in all_results_for_agent for key in row})
                     with open(tmp_path, "w", newline="") as csvfile:
                         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                         writer.writeheader()
                         writer.writerows(all_results_for_agent)
+                    if deploy_cleanup_failed:
+                        final_csv_path = base_dir / str(agent_to_run) / pid / f"{pid}_{agent_to_run}_results.csv"
+                        final_csv_path.parent.mkdir(parents=True, exist_ok=True)
+                        os.replace(tmp_path, final_csv_path)
+                        progress.advance(task_id, len(attempts_to_run) - attempt_position)
+                        progress.stop()
+                        if not use_external_harness:
+                            conductor.stop_k8s_proxy()
+                        if conductor.results.get("cleanup_timed_out"):
+                            deploy_abort_reason = (
+                                "Benchmark cleanup did not terminate during deployment; "
+                                "later attempts were not started against uncertain state."
+                            )
+                        else:
+                            deploy_abort_reason = (
+                                "Benchmark cleanup failed during deployment; "
+                                "later attempts were not started against uncertain state."
+                            )
+                        raise BenchmarkCampaignAborted(
+                            deploy_abort_reason,
+                            [{agent_to_run: all_results_for_agent}],
+                        )
                     console.log(f"⏭️  Skipping remaining attempts for '{pid}' and moving to next problem")
                     # Account for this attempt + remaining skipped attempts on the bar.
-                    progress.advance(task_id, n_attempts - attempt + 1)
+                    progress.advance(task_id, len(attempts_to_run) - attempt_position)
                     break
 
                 if result == StartProblemResult.SKIPPED_KHAOS_REQUIRED:
                     console.log(f"⏭️  Skipping problem '{pid}': requires Khaos but running on emulated cluster")
-                    progress.advance(task_id, n_attempts - attempt + 1)
+                    progress.advance(task_id, len(attempts_to_run) - attempt_position)
                     break  # Skip to next problem
 
                 # If using external harness, fault is injected - exit now
@@ -270,69 +460,158 @@ def driver_loop(
 
                 assert agent_to_run is not None
 
-                # Create the run directory and point the agent at it before launch
-                run_dir = base_dir / agent_to_run / pid / f"run_{attempt}"
-                run_dir.mkdir(parents=True, exist_ok=True)
-                os.environ["AGENT_LOGS_DIR"] = str(run_dir.resolve())
+                run = RunArtifacts.create(
+                    staging_root=Path(".runtime"),
+                    results_root=base_dir,
+                    problem_id=pid,
+                    agent=agent_to_run,
+                    attempt=attempt,
+                )
+                agent_proc = None
 
-                reg = get_agent(agent_to_run, path=Path(os.path.dirname(os.path.abspath(__file__))) / "agents.yaml")
-                if reg:
-                    await LAUNCHER.ensure_started(reg)
+                if conductor.stage_sequence:
+                    with _artifact_environment(run):
+                        reg = get_agent(
+                            agent_to_run,
+                            path=Path(os.path.dirname(os.path.abspath(__file__))) / "agents.yaml",
+                        )
+                        if reg:
+                            agent_proc = await LAUNCHER.ensure_started(reg)
+                else:
+                    console.log("⏩ No agent stages are configured; waiting only for bounded cleanup")
+                    if conductor.close_submissions():
+                        try:
+                            await conductor.wait_for_submission_work(timeout=CLEANUP_DRAIN_TIMEOUT_SECONDS)
+                        except TimeoutError:
+                            abort_campaign_after_attempt = True
+                            conductor.abandon_submission_work()
+                            conductor.results["cleanup_timed_out"] = True
+                            conductor.record_incomplete_attempt("cleanup_timeout_without_agent_stages")
+                        except Exception as exc:
+                            abort_campaign_after_attempt = True
+                            conductor.results["cleanup_failed"] = True
+                            conductor.results["cleanup_error"] = f"{type(exc).__name__}: {exc}"
+                            conductor.record_incomplete_attempt("cleanup_failed")
 
-                # Poll until grading completes, agent exits, or timeout
+                timed_out = False
                 agent_start_time = time.time()
-                while conductor.submission_stage != "done":
-                    # Check agent timeout
+                while not abort_campaign_after_attempt and conductor.submission_stage != "done":
                     if time.time() - agent_start_time > agent_timeout:
+                        timed_out = True
                         console.log(f"⏰ Agent timeout ({agent_timeout}s) exceeded, killing agent")
+                        submission_work = conductor.close_submissions()
                         LAUNCHER.cleanup_agent(agent_to_run)
-
-                        # Record timeout in results so downstream CSV captures the failure
                         conductor.results["timed_out"] = True
                         conductor.results["agent_timeout_seconds"] = agent_timeout
-
-                        # Trigger conductor cleanup (fault recovery, teardown) so the
-                        # next problem starts from a clean state.
-                        console.log("🧹 Running conductor cleanup after agent timeout...")
-                        conductor._finish_problem()
-
+                        evaluation_failed = False
+                        if submission_work:
+                            console.log("⏳ Waiting for the accepted submission evaluation to complete...")
+                            try:
+                                await conductor.wait_for_submission_evaluations(
+                                    timeout=EVALUATION_DRAIN_TIMEOUT_SECONDS
+                                )
+                            except TimeoutError:
+                                evaluation_failed = True
+                                abort_campaign_after_attempt = True
+                                conductor.abandon_submission_work()
+                                console.log(
+                                    "⛔ Submission evaluation did not finish before the evaluation deadline; "
+                                    "aborting the campaign without concurrent cluster cleanup"
+                                )
+                            except Exception as e:
+                                evaluation_failed = True
+                                console.log(f"⚠️  Conductor evaluation raised: {e}")
+                        if abort_campaign_after_attempt:
+                            reason = "evaluation_timeout_after_agent_timeout"
+                        else:
+                            reason = "evaluation_failed_after_agent_timeout" if evaluation_failed else "agent_timeout"
+                        if evaluation_failed or conductor.missing_submission_stages():
+                            conductor.record_incomplete_attempt(reason)
+                        if not abort_campaign_after_attempt:
+                            console.log("🧹 Running conductor cleanup after agent timeout...")
+                            cleanup_succeeded = await finish_problem_with_deadline(
+                                "cleanup_timeout_after_agent_timeout"
+                            )
+                            abort_campaign_after_attempt = not cleanup_succeeded
                         break
 
-                    # Check if agent process has exited
-                    agent_proc = LAUNCHER._procs.get(agent_to_run)
-                    if agent_proc:
-                        agent_proc.proc.poll()
-                        if agent_proc.proc.returncode is not None:
-                            console.log(f"⚠️  Agent process exited with return code {agent_proc.proc.returncode}")
-                            # Wait for the conductor's background evaluation to finish.
-                            # await the conductor's submit_future
-                            if conductor._submit_future is not None and not conductor._submit_future.done():
+                    tracked_proc = LAUNCHER._procs.get(agent_to_run) or agent_proc
+                    if tracked_proc:
+                        tracked_proc.proc.poll()
+                        if tracked_proc.proc.returncode is not None:
+                            agent_proc = tracked_proc
+                            console.log(f"⚠️  Agent process exited with return code {tracked_proc.proc.returncode}")
+                            submission_work = conductor.close_submissions()
+                            evaluation_failed = False
+                            if submission_work:
                                 console.log("⏳ Waiting for conductor evaluation to complete...")
                                 try:
-                                    await asyncio.wait_for(
-                                        asyncio.wrap_future(conductor._submit_future),
-                                        timeout=300,
+                                    await conductor.wait_for_submission_evaluations(
+                                        timeout=EVALUATION_DRAIN_TIMEOUT_SECONDS
                                     )
                                 except TimeoutError:
-                                    console.log("⚠️  Conductor evaluation did not finish within 300s")
+                                    evaluation_failed = True
+                                    abort_campaign_after_attempt = True
+                                    conductor.abandon_submission_work()
+                                    console.log(
+                                        "⛔ Submission evaluation did not finish before the evaluation deadline; "
+                                        "aborting the campaign without concurrent cluster cleanup"
+                                    )
                                 except Exception as e:
+                                    evaluation_failed = True
                                     console.log(f"⚠️  Conductor evaluation raised: {e}")
-
-                            # Clean up fault injection and teardown so the next
-                            # problem starts from a clean state (matches timeout path).
-                            console.log("🧹 Running conductor cleanup after agent exit...")
-                            conductor._finish_problem()
-
+                            missing_stages = conductor.missing_submission_stages()
+                            if abort_campaign_after_attempt or evaluation_failed or missing_stages:
+                                if abort_campaign_after_attempt:
+                                    reason = "evaluation_timeout_after_agent_exit"
+                                elif evaluation_failed:
+                                    reason = "evaluation_failed_after_agent_exit"
+                                else:
+                                    reason = "agent_exited_before_all_stages_completed"
+                                conductor.record_incomplete_attempt(
+                                    reason,
+                                    agent_return_code=tracked_proc.proc.returncode,
+                                )
+                            if not abort_campaign_after_attempt:
+                                console.log("🧹 Running conductor cleanup after agent exit...")
+                                cleanup_succeeded = await finish_problem_with_deadline(
+                                    "cleanup_timeout_after_agent_exit"
+                                )
+                                abort_campaign_after_attempt = not cleanup_succeeded
                             break
                     await asyncio.sleep(1)
 
-                console.log(f"✅ Completed {pid}: results={conductor.results}", markup=False)
+                # The final evaluator sets stage=done during cleanup just
+                # before its worker future returns. Consume that future before
+                # freezing the attempt snapshot or starting another attempt.
+                if not abort_campaign_after_attempt and conductor.close_submissions():
+                    try:
+                        await conductor.wait_for_submission_work(timeout=CLEANUP_DRAIN_TIMEOUT_SECONDS)
+                    except TimeoutError:
+                        abort_campaign_after_attempt = True
+                        conductor.abandon_submission_work()
+                        conductor.results["cleanup_timed_out"] = True
+                        conductor.record_incomplete_attempt("cleanup_timeout_after_stage_completion")
+                        console.log(
+                            "⛔ Conductor cleanup did not finish before the cleanup deadline; "
+                            "aborting without starting another attempt"
+                        )
+                    except Exception as e:
+                        console.log(f"⚠️  Conductor cleanup raised after stage completion: {e}")
+                        conductor.results["cleanup_failed"] = True
+                        conductor.results["cleanup_error"] = f"{type(e).__name__}: {e}"
+                        conductor.record_incomplete_attempt("cleanup_failed")
 
+                run_status = conductor.finalize_attempt_status()
+                if conductor.results.get("cleanup_failed"):
+                    abort_campaign_after_attempt = True
+                status_icon = "✅" if run_status == "complete" else "⚠️"
+                console.log(f"{status_icon} {run_status.capitalize()} {pid}: results={conductor.results}", markup=False)
                 # Wait for agent process to complete naturally before cleanup
                 # This allows the agent to finish saving trajectories and other cleanup tasks
                 if not use_external_harness:
-                    agent_proc = LAUNCHER._procs.get(agent_to_run)
-                    if agent_proc:
+                    agent_proc = LAUNCHER._procs.get(agent_to_run) or agent_proc
+                    if agent_proc and not timed_out and not abort_campaign_after_attempt:
                         console.log("⏳ Waiting for agent process to complete...")
                         timeout = 60  # seconds
                         elapsed = 0
@@ -346,11 +625,16 @@ def driver_loop(
                         else:
                             console.log(f"⚠️  Agent process did not complete within {timeout}s, will force cleanup")
 
+                    # Publication must happen only after cleanup_agent has reaped
+                    # the tracked docker client or shell process tree.
+                    LAUNCHER.cleanup_agent(agent_to_run)
+                    console.log(f"🧹 Cleaned up agent process for {agent_to_run}")
+
                 snapshot = {
                     "problem_id": pid,
                     "attempt": attempt,
                 }
-
+                snapshot.update(LAUNCHER.internet_policy_result(agent_proc))
                 for stage, outcome in conductor.results.items():
                     if isinstance(outcome, dict):
                         for k, v in outcome.items():
@@ -358,39 +642,93 @@ def driver_loop(
                     else:
                         snapshot[stage] = outcome
 
+                fieldnames = sorted({key for row in [*all_results_for_agent, snapshot] for key in row})
+                ownership_image = (
+                    LAUNCHER._container_runner.config.image
+                    if LAUNCHER._container_runner is not None
+                    else "sregym-agent-base:latest"
+                )
+                try:
+                    published_run_dir = run.finalize_and_publish(
+                        snapshot=snapshot,
+                        fieldnames=fieldnames,
+                        ownership_image=ownership_image,
+                    )
+                except ArtifactFinalizationError as exc:
+                    snapshot["artifact_finalization_failed"] = True
+                    snapshot["artifact_staging_path"] = str(run.active_dir)
+                    logger.error(
+                        "Artifact finalization failed for %s attempt %s; staging retained at %s: %s",
+                        pid,
+                        attempt,
+                        run.active_dir,
+                        exc,
+                    )
+                    published_run_dir = None
+
                 all_results_for_agent.append(snapshot)
-
                 fieldnames = sorted({key for row in all_results_for_agent for key in row})
-
                 with open(tmp_path, "w", newline="") as csvfile:
                     writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                     writer.writeheader()
                     writer.writerows(all_results_for_agent)
 
-                # run_dir was created above before agent launch; write per-attempt CSV into it
-                attempt_path = run_dir / f"{pid}_results.csv"
-                with open(attempt_path, "w", newline="") as csvfile:
-                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                    writer.writeheader()
-                    writer.writerow(snapshot)
-
-                logger.info(
-                    f"⏳ Attempt {attempt} of {n_attempts} for problem {pid} complete - Intermediate results written to {tmp_path}"
-                )
-
-                if attempt == n_attempts:
-                    final_csv_path = base_dir / agent_to_run / pid / f"{pid}_{agent_to_run}_results.csv"
-                    os.replace(tmp_path, final_csv_path)
+                if published_run_dir is not None:
                     logger.info(
-                        f"✅ Problem {pid} for agent {agent_to_run} complete! Results written to {final_csv_path}"
+                        f"⏳ Attempt {attempt} of {n_attempts} for problem {pid} complete - "
+                        f"Intermediate results written to {tmp_path}; artifacts published to {published_run_dir}"
                     )
+                    # Normalize the agent's raw logs into an ATIF trajectory.json
+                    # right after publication. Non-fatal: a conversion failure or
+                    # an unsupported tool must never break the run.
+                    trajectory_path = trace_postprocess.write_trajectory(published_run_dir)
+                    if trajectory_path is not None:
+                        logger.info(f"📝 ATIF trajectory written to {trajectory_path}")
+                        try:
+                            trace_store.ingest_trajectory_file(
+                                trajectory_path,
+                                base_dir.parent / trace_store.DEFAULT_DB_PATH,  # results/traces.db
+                            )
+                        except Exception as exc:  # defensive: never abort a run
+                            logger.warning(f"⚠️ ATIF trajectory DB ingest failed: {exc}")
+                    else:
+                        logger.warning(f"⚠️ ATIF trajectory conversion skipped for {published_run_dir}")
 
-                # Cleanup agent process so a fresh one can be started for the next problem
-                if not use_external_harness:
-                    LAUNCHER.cleanup_agent(agent_to_run)
-                    console.log(f"🧹 Cleaned up agent process for {agent_to_run}")
+                if attempt == attempts_to_run[-1] or abort_campaign_after_attempt:
+                    final_csv_path = base_dir / agent_to_run / pid / f"{pid}_{agent_to_run}_results.csv"
+                    final_csv_path.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(tmp_path, final_csv_path)
+                    if abort_campaign_after_attempt:
+                        logger.error(
+                            f"⛔ Problem {pid} for agent {agent_to_run} stopped incomplete. "
+                            f"Partial results written to {final_csv_path}"
+                        )
+                    else:
+                        logger.info(
+                            f"✅ Problem {pid} for agent {agent_to_run} complete! Results written to {final_csv_path}"
+                        )
 
                 progress.advance(task_id)
+
+                if abort_campaign_after_attempt:
+                    if conductor.results.get("cleanup_failed"):
+                        abort_reason = (
+                            "Benchmark cleanup failed; later attempts were not started against uncertain state."
+                        )
+                    elif conductor.results.get("cleanup_timed_out"):
+                        abort_reason = "Benchmark cleanup did not terminate; later attempts were not started against uncertain state."
+                    else:
+                        abort_reason = (
+                            "A submission evaluator did not terminate safely. "
+                            "The next benchmark startup will clean the remaining fault state."
+                        )
+                    console.log(f"⛔ Benchmark stopped: {abort_reason}")
+                    progress.stop()
+                    conductor.stop_k8s_proxy()
+                    raise BenchmarkCampaignAborted(
+                        abort_reason,
+                        [{agent_to_run: all_results_for_agent}],
+                    )
 
         progress.stop()
 
@@ -406,7 +744,7 @@ def driver_loop(
 
 def _run_driver_and_shutdown(
     conductor: Conductor,
-    problem_filter: str | None = None,
+    problem_selection: Sequence[str] | None = None,
     agent_to_run: str | None = None,
     use_external_harness: bool = False,
     n_attempts: int = 1,
@@ -414,19 +752,24 @@ def _run_driver_and_shutdown(
     resume_csv: str | None = None,
 ):
     """Run the benchmark driver, stash results, then tell the API to exit."""
+    global _driver_error, _driver_results
     try:
         results = driver_loop(
             conductor,
-            problem_filter=problem_filter,
+            problem_selection=problem_selection,
             agent_to_run=agent_to_run,
             use_external_harness=use_external_harness,
             n_attempts=n_attempts,
             agent_timeout=agent_timeout,
             resume_csv=resume_csv,
         )
-        global _driver_results
         _driver_results = results
-    except Exception:
+    except BenchmarkCampaignAborted as exc:
+        _driver_results = exc.partial_results
+        _driver_error = exc
+        logger.error("Benchmark campaign aborted: %s", exc)
+    except BaseException as exc:
+        _driver_error = exc
         logger.exception("Driver thread crashed")
     finally:
         LAUNCHER.cleanup_all()
@@ -434,24 +777,31 @@ def _run_driver_and_shutdown(
 
 
 def main(args):
+    global _driver_error, _driver_results
+    _driver_error = None
+    _driver_results = []
+
     # set up the logger
     init_logger()
 
-    agent_model = args.model
-    judge_model = args.judge_model or args.model
+    agent_model, judge_model = _configure_model_environment(args)
+    internet_policy = InternetPolicy.from_mode(args.internet_access)
+
+    set_profile(args.profile)
 
     if args.noise:
         logger.info("Noise injection enabled.")
-
-    # Push to env so downstream code picks it up
-    os.environ["AGENT_MODEL_ID"] = agent_model
-    os.environ["JUDGE_MODEL_ID"] = judge_model
     os.environ["API_HOSTNAME"] = "0.0.0.0"
     os.environ["API_PORT"] = "8000"
     os.environ["MCP_SERVER_PORT"] = "9954"
     os.environ["MCP_SERVER_URL"] = "http://127.0.0.1:9954"
 
-    logger.info(f"🔧 Config — agent: {args.agent}, agent_model: {agent_model}, judge_model: {judge_model}")
+    logger.info(
+        f"🔧 Config — agent: {args.agent}, agent_model: {agent_model}, judge_model: {judge_model}, "
+        f"reasoning_effort: {getattr(args, 'reasoning_effort', None) or 'agent default'}, "
+        f"internet_access: {internet_policy.mode.value}, "
+        f"agent_api_base: {_env_status('AGENT_API_BASE')}, judge_api_base: {_env_status('JUDGE_API_BASE')}"
+    )
 
     # Only build/check agent container image if the agent requires it
     agent_reg = (
@@ -459,26 +809,62 @@ def main(args):
         if args.agent
         else None
     )
-    if not agent_reg or agent_reg.container_isolation:
-        LAUNCHER.enable_container_isolation(force_build=args.force_build)
+    if (
+        internet_policy.is_filtered
+        and not args.use_external_harness
+        and agent_reg
+        and not agent_reg.container_isolation
+    ):
+        raise RuntimeError(
+            f"Agent '{agent_reg.name}' does not use container isolation. "
+            "Run it with --internet-access open or enable container isolation."
+        )
 
-    # Pre-flight check — makes a real (minimal) API call inside the agent
-    # container to validate model and credentials in one shot.
-    run_preflight_check(
-        args.agent,
-        container_runner=LAUNCHER._container_runner,
-        install_script=agent_reg.install_script if agent_reg else None,
+    if not args.use_external_harness:
+        run_judge_preflight_check()
+
+    k8s_proxy_listen_host = (
+        get_container_host_bind_address()
+        if internet_policy.is_filtered and not args.use_external_harness
+        else "127.0.0.1"
     )
+    conductor_config = ConductorConfig(
+        deploy_loki=not args.use_external_harness,
+        enable_noise=args.noise,
+        internet_policy=internet_policy,
+        k8s_proxy_listen_host=k8s_proxy_listen_host,
+        block_workload_creation=internet_policy.is_filtered,
+    )
+    LAUNCHER.set_internet_policy(conductor_config.internet_policy)
 
-    conductor_config = ConductorConfig(deploy_loki=not args.use_external_harness, enable_noise=args.noise)
+    try:
+        if not agent_reg or agent_reg.container_isolation:
+            LAUNCHER.enable_container_isolation(force_build=args.force_build)
+
+        # Pre-flight check — makes a real (minimal) API call inside the agent
+        # container to validate model and credentials in one shot.
+        run_preflight_check(
+            args.agent,
+            container_runner=LAUNCHER._container_runner,
+            install_script=agent_reg.install_script if agent_reg else None,
+        )
+    except BaseException:
+        LAUNCHER.cleanup_all()
+        raise
+
     conductor = Conductor(config=conductor_config)
+
+    suite = getattr(args, "suite", None)
+    problem_selection = (args.problem,) if args.problem else PROBLEM_SETS.get(suite)
+    if suite:
+        logger.info(f"Running {suite}: {len(problem_selection)} problems")
 
     # Start the driver in the background; it will call request_shutdown() when finished
     driver_thread = threading.Thread(
         target=_run_driver_and_shutdown,
         args=(
             conductor,
-            args.problem,
+            problem_selection,
             args.agent,
             args.use_external_harness,
             args.n_attempts,
@@ -531,9 +917,17 @@ def main(args):
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                 writer.writeheader()
                 writer.writerows(agent_results)
-            logger.info(f"✅ Benchmark complete! Results for {agent_name} written to {csv_path}")
+            if _driver_error is None:
+                logger.info(f"✅ Benchmark complete! Results for {agent_name} written to {csv_path}")
+            else:
+                logger.error(f"⛔ Partial benchmark results for {agent_name} written to {csv_path}")
     else:
         logger.warning("⚠️ No results to write.")
+
+    if _driver_error is not None:
+        if __name__ == "__main__":
+            raise SystemExit(1) from _driver_error
+        raise RuntimeError("Benchmark campaign did not complete") from _driver_error
 
     if __name__ == "__main__":
         # separate run, use exit
@@ -544,13 +938,19 @@ def main(args):
 
 
 if __name__ == "__main__":
-    # Parse command-line arguments
     parser = argparse.ArgumentParser(description="Run SREGym benchmark suite")
-    parser.add_argument(
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument(
         "--problem",
         type=str,
         default=None,
         help="Run only a specific problem by its ID (e.g., 'target_port')",
+    )
+    selection.add_argument(
+        "--suite",
+        choices=tuple(PROBLEM_SETS),
+        default=None,
+        help="Run a named problem set (e.g., 'sregym-lite')",
     )
     parser.add_argument(
         "--agent",
@@ -571,12 +971,36 @@ if __name__ == "__main__":
         help="Model for the LLM-as-a-judge evaluator (defaults to --model if not set)",
     )
     parser.add_argument(
+        "--reasoning-effort",
+        choices=("none", "minimal", "low", "medium", "high", "xhigh", "max"),
+        default=None,
+        help="Reasoning effort for Codex, Copilot, OpenCode, and Claude Code (uses the agent default when omitted)",
+    )
+    parser.add_argument(
         "--use-external-harness", action="store_true", help="For use in external harnesses, deploy the fault and exit."
+    )
+    parser.add_argument(
+        "--profile",
+        choices=PROFILES,
+        default=os.environ.get("SREGYM_PROFILE", "full"),
+        help=(
+            "Deployment profile (independent of --suite). 'full' (default) deploys the standard "
+            "stack. 'svelte' additionally drops components no part of SREGym reads — astronomy-shop's "
+            "bundled OpenSearch/Grafana/Jaeger, Prometheus Alertmanager/Pushgateway, the OpenEBS NDM "
+            "stack — and shortens metric retention. 'svelte' changes what an agent can observe, so "
+            "its results are not comparable with 'full'."
+        ),
     )
     parser.add_argument(
         "--noise",
         action="store_true",
         help="Enable transient noise injection via Chaos Mesh during problem runs",
+    )
+    parser.add_argument(
+        "--internet-access",
+        choices=("filtered", "open"),
+        default="filtered",
+        help="Agent internet policy. Filtered mode blocks direct access to SREGym GitHub source.",
     )
     parser.add_argument(
         "--n-attempts",
@@ -603,8 +1027,9 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    # Validate that n_attempts is positive
     if args.n_attempts is not None and args.n_attempts < 1:
         parser.error("--n-attempts must be a positive integer")
+    if args.use_external_harness and args.suite:
+        parser.error("--use-external-harness cannot be used with --suite; use --problem instead")
 
     main(args)
