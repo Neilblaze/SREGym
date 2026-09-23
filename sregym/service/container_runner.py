@@ -455,7 +455,6 @@ class ContainerRunner:
         if extra_env:
             env_vars.update(extra_env)
 
-        # ponytail: /logs keeps the pinned image working until its driver fix is published.
         if self.config.internet_policy.agent_name == "codex" and env_vars.get("AGENT_API_BASE"):
             env_vars.setdefault("CODEX_HOME", "/logs")
 
